@@ -1,0 +1,1017 @@
+#!/bin/bash
+# 8-Habit AI Dev — Content Quality Validation (pure bash, no dependencies)
+# Requires bash (process substitution). Do not run with sh.
+# Validates content depth, markdown integrity, ADR format, handoff completeness,
+# and computes architecture fitness functions.
+# Companion to validate-structure.sh (which checks structure/wiring).
+
+set -euo pipefail
+
+ERRORS=0
+PASS=0
+WARNINGS=0
+
+pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
+fail() { ERRORS=$((ERRORS + 1)); echo "  FAIL: $1"; }
+warn() { WARNINGS=$((WARNINGS + 1)); echo "  WARN: $1"; }
+
+echo "=== 8-Habit Plugin Content Quality Validation ==="
+echo ""
+
+# --- Check 11: Section content depth ---
+echo "--- Check 11: Section content depth (When to Skip + Definition of Done) ---"
+for skill_dir in skills/*/; do
+  skill_file="${skill_dir}SKILL.md"
+  [ ! -f "$skill_file" ] && continue
+  skill_name=$(basename "$skill_dir")
+
+  # Check "When to Skip" has content (≥2 non-empty lines between heading and next ##)
+  skip_content=$(awk '/^## When to Skip/{found=1; next} /^## /{if(found) exit} found && NF' "$skill_file" | wc -l | tr -d ' ')
+  if [ "$skip_content" -ge 2 ]; then
+    pass "$skill_name — When to Skip has $skip_content content lines"
+  else
+    fail "$skill_name — When to Skip has only $skip_content content lines (need ≥2)"
+  fi
+
+  # Check "Definition of Done" has 3-5 checkbox items
+  dod_items=$(awk '/^## Definition of Done/{found=1; next} /^## /{if(found) exit} found' "$skill_file" | grep -c '^\- \[ \]' || true)
+  if [ "$dod_items" -ge 3 ] && [ "$dod_items" -le 9 ]; then
+    pass "$skill_name — Definition of Done has $dod_items items"
+  elif [ "$dod_items" -lt 3 ]; then
+    fail "$skill_name — Definition of Done has $dod_items items (need ≥3)"
+  else
+    warn "$skill_name — Definition of Done has $dod_items items (consider splitting)"
+  fi
+done
+echo ""
+
+# --- Check 12: Markdown integrity ---
+echo "--- Check 12: Markdown integrity ---"
+MD_INTEGRITY_FAIL=0
+
+# 12a: Orphan code blocks (odd count of triple-backtick lines)
+while read -r f; do
+  fence_count=$(grep -c '^```' "$f" || true)
+  if [ $((fence_count % 2)) -ne 0 ]; then
+    fail "$f has $fence_count fence lines (odd — unclosed code block)"
+    MD_INTEGRITY_FAIL=$((MD_INTEGRITY_FAIL + 1))
+  fi
+done < <(find skills/ habits/ guides/ agents/ docs/ -name "*.md" -type f 2>/dev/null)
+if [ "$MD_INTEGRITY_FAIL" -eq 0 ]; then
+  pass "All markdown files have balanced code fences"
+fi
+
+# 12b: Broken internal links (relative .md links)
+LINK_FAIL=0
+while read -r f; do
+  dir=$(dirname "$f")
+  # Extract markdown links — only check relative .md links
+  while IFS= read -r link_target; do
+    [ -z "$link_target" ] && continue
+    # Resolve relative path from file's directory
+    resolved="$dir/$link_target"
+    if [ ! -f "$resolved" ]; then
+      fail "$f links to '$link_target' but file not found"
+      LINK_FAIL=$((LINK_FAIL + 1))
+    fi
+  done < <(grep -o '\]([^)]*)' "$f" 2>/dev/null | sed 's/\](//' | sed 's/)//' | grep -v '^http' | grep -v '^#' | grep -v '^\$' | grep -v '^$' | grep '\.md' | sed 's/#.*//' || true)
+done < <(find skills/ habits/ guides/ docs/ -name "*.md" -type f 2>/dev/null)
+if [ "$LINK_FAIL" -eq 0 ]; then
+  pass "All internal markdown links resolve to existing files"
+fi
+
+# 12c: TODO/FIXME markers in published skills content
+# Exception 1: skills/consistency-check/ documents the patterns it detects (Ambiguity pass)
+# so literal TODO/FIXME/HACK/XXX strings appear as detection-target documentation, not as
+# unresolved markers. Whitelisted intentionally; see ADR-013 + skills/consistency-check/SKILL.md.
+# Exception 2: skills/save-spec/ uses `<!-- TODO: ... -->` HTML comments as the scaffold
+# template's user-fill placeholders (F1 fix per issue #203 — replaces literal angle-bracket
+# placeholders that shipped unfilled). These are intentional fill-me-in signals visible to
+# the editor and invisible at render, NOT unresolved code markers.
+TODO_FAIL=0
+while read -r f; do
+  case "$f" in
+    skills/consistency-check/*) continue ;;
+    skills/save-spec/*) continue ;;
+  esac
+  todo_count=$(grep -ciE '\bTODO\b|\bFIXME\b|\bHACK\b|\bXXX\b' "$f" || true)
+  if [ "$todo_count" -gt 0 ]; then
+    fail "$f has $todo_count TODO/FIXME/HACK/XXX markers"
+    TODO_FAIL=$((TODO_FAIL + 1))
+  fi
+done < <(find skills/ -name "*.md" -type f 2>/dev/null)
+if [ "$TODO_FAIL" -eq 0 ]; then
+  pass "No TODO/FIXME markers in skills/ content (consistency-check whitelisted — documents detection patterns)"
+fi
+
+# 12c.1: R5-3 regression — save-spec §2 template alignment row + substitution must be adjacent
+# Standard Markdown table requires the row after the alignment row to be a data row (no blank
+# line between). The skill's template uses an HTML-comment + substitution marker pattern that
+# the generator replaces — the marker MUST sit directly under the alignment row, or every
+# scaffolded SPEC.md ships with a broken §2 table. Issue #205 R5-3.
+SAVESPEC_REF="skills/save-spec/reference.md"
+if [ -f "$SAVESPEC_REF" ]; then
+  # Find the §2 alignment row line number; the very next non-comment, non-blank line must be
+  # either a data row (starts with `|`) or the substitution marker (starts with `<`).
+  # Flexible match — formatter may widen column padding so any 4-column alignment
+  # row with --- in each cell qualifies. The §2 table is the only one in this file
+  # with exactly 4 columns of dashes, so first match is the right one.
+  align_line=$(grep -nE '^\|[[:space:]-]+\|[[:space:]-]+\|[[:space:]-]+\|[[:space:]-]+\|[[:space:]]*$' "$SAVESPEC_REF" | grep -E ':\|[[:space:]]+-{3}' | head -1 | cut -d: -f1)
+  if [ -n "$align_line" ]; then
+    # Check the next two lines: line N+1 may be an HTML comment; the data-or-marker line MUST
+    # NOT be preceded by a blank line.
+    next_line=$(sed -n "$((align_line + 1))p" "$SAVESPEC_REF")
+    if [ -z "$next_line" ] || [[ "$next_line" =~ ^[[:space:]]*$ ]]; then
+      fail "R5-3 regression: $SAVESPEC_REF §2 alignment row at line $align_line is followed by a BLANK line; scaffolded SPEC.md §2 table will render broken (issue #205)"
+    else
+      pass "R5-3 regression check: $SAVESPEC_REF §2 alignment row is followed by a non-blank line (table renders correctly)"
+    fi
+  fi
+fi
+
+# 12d: Empty links [text]() or [](url)
+EMPTY_LINK_FAIL=0
+while read -r f; do
+  empty_text=$(grep -c '\[\]([^)]*)' "$f" || true)
+  empty_url=$(grep -cE '\[[^]]+\]\(\)' "$f" || true)
+  total=$((empty_text + empty_url))
+  if [ "$total" -gt 0 ]; then
+    fail "$f has $total empty link(s)"
+    EMPTY_LINK_FAIL=$((EMPTY_LINK_FAIL + 1))
+  fi
+done < <(find skills/ habits/ guides/ docs/ -name "*.md" -type f 2>/dev/null)
+if [ "$EMPTY_LINK_FAIL" -eq 0 ]; then
+  pass "No empty links found"
+fi
+echo ""
+
+# --- Check 13: ADR format validation ---
+echo "--- Check 13: ADR format validation ---"
+ADR_COUNT=0
+if [ -d "docs/adr" ]; then
+  while read -r adr_file; do
+    ADR_COUNT=$((ADR_COUNT + 1))
+    adr_name=$(basename "$adr_file")
+
+    # Required sections
+    for section in "## Context" "## Options Considered" "## Decision" "## Consequences"; do
+      if grep -q "^${section}" "$adr_file"; then
+        pass "$adr_name has '$section'"
+      else
+        fail "$adr_name missing '$section'"
+      fi
+    done
+
+    # Required metadata
+    if grep -q '\*\*Status\*\*:' "$adr_file"; then
+      # Validate status value
+      status_val=$(grep '\*\*Status\*\*:' "$adr_file" | head -1 | sed 's/.*\*\*Status\*\*:[[:space:]]*//')
+      # Status vocabulary per docs/adr/README.md §"Status field vocabulary" (F15, #368):
+      # plain states, plus 'Accepted (amended YYYY-MM-DD, #NNN)' and 'Superseded by ADR-NNN'.
+      case "$status_val" in
+        Proposed|Accepted|Deprecated|Superseded)
+          pass "$adr_name status '$status_val' is valid"
+          ;;
+        "Accepted (amended "*|"Superseded by ADR-"*)
+          pass "$adr_name status '$status_val' is valid (amended/superseded vocabulary)"
+          ;;
+        *)
+          fail "$adr_name status '$status_val' not in [Proposed, Accepted, Deprecated, Superseded, 'Accepted (amended YYYY-MM-DD, #NNN)', 'Superseded by ADR-NNN']"
+          ;;
+      esac
+    else
+      fail "$adr_name missing '**Status**:' field"
+    fi
+
+    if grep -q '\*\*Date\*\*:' "$adr_file"; then
+      pass "$adr_name has '**Date**:'"
+    else
+      fail "$adr_name missing '**Date**:' field"
+    fi
+  done < <(find docs/adr/ -name "ADR-*.md" -type f 2>/dev/null | sort)
+fi
+if [ "$ADR_COUNT" -eq 0 ]; then
+  warn "No ADR files found in docs/adr/"
+fi
+echo ""
+
+# --- Check 14: Handoff content validation ---
+echo "--- Check 14: Handoff content validation (workflow skills) ---"
+WORKFLOW_SKILLS="research requirements design breakdown build-brief review-ai deploy-guide monitor-setup"
+for skill_name in $WORKFLOW_SKILLS; do
+  skill_file="skills/$skill_name/SKILL.md"
+  [ ! -f "$skill_file" ] && continue
+
+  # Check Handoff section exists
+  if ! grep -q "^## Handoff" "$skill_file"; then
+    fail "$skill_name missing '## Handoff' section"
+    continue
+  fi
+
+  # Extract handoff section content
+  handoff_content=$(awk '/^## Handoff/{found=1; next} /^## /{if(found) exit} found' "$skill_file")
+
+  if echo "$handoff_content" | grep -qi "expects from predecessor"; then
+    pass "$skill_name — Handoff has 'Expects from predecessor'"
+  else
+    fail "$skill_name — Handoff missing 'Expects from predecessor'"
+  fi
+
+  if echo "$handoff_content" | grep -qi "produces for successor"; then
+    pass "$skill_name — Handoff has 'Produces for successor'"
+  else
+    fail "$skill_name — Handoff missing 'Produces for successor'"
+  fi
+done
+echo ""
+
+# --- Check 15: v2.14.2 EU AI Act stub (post-migration to claude-governance v3.1.0) ---
+echo "--- Check 15: v2.14.2 EU AI Act stub (post-migration) ---"
+# Per ADR-012 (2026-05-02): EU AI Act toolkit migrated to claude-governance v3.1.0.
+# This plugin retains a redirect stub; deleted files live in governance-side validate-plugin.sh §6.
+# Verifies: stub exists, redirects, preserves NOT LEGAL ADVICE, deleted files absent (catches restore).
+
+EU_STUB="skills/eu-ai-act-check/SKILL.md"
+if [ -f "$EU_STUB" ]; then
+  pass "$EU_STUB redirect stub exists"
+  if grep -q "pitimon/claude-governance" "$EU_STUB"; then
+    pass "$EU_STUB redirects to pitimon/claude-governance"
+  else
+    fail "$EU_STUB missing pitimon/claude-governance redirect"
+  fi
+  if grep -q "NOT LEGAL ADVICE\|not legal advice" "$EU_STUB"; then
+    pass "$EU_STUB preserves NOT LEGAL ADVICE disclaimer"
+  else
+    fail "$EU_STUB missing NOT LEGAL ADVICE disclaimer"
+  fi
+  if grep -q "ADR-012" "$EU_STUB"; then
+    pass "$EU_STUB references migration ADR-012"
+  else
+    fail "$EU_STUB missing ADR-012 reference"
+  fi
+else
+  fail "$EU_STUB not found"
+fi
+
+# Negative checks: deleted files must not have been restored
+for deleted_file in \
+  "skills/eu-ai-act-check/reference.md" \
+  "docs/research/eu-ai-act-obligations.md" \
+  "guides/eu-ai-act-mapping.md"; do
+  if [ -f "$deleted_file" ]; then
+    fail "$deleted_file was restored — should be deleted post-migration (see ADR-012)"
+  else
+    pass "$deleted_file correctly absent post-migration"
+  fi
+done
+
+# ADR-012 itself must exist
+if [ -f "docs/adr/ADR-012-eu-ai-act-migration-completion.md" ]; then
+  pass "docs/adr/ADR-012 (migration completion) exists"
+else
+  fail "docs/adr/ADR-012 (migration completion) not found"
+fi
+
+# ADR-005 must be marked as Superseded
+if [ -f "docs/adr/ADR-005-eu-ai-act-compliance-toolkit.md" ]; then
+  if grep -qE 'Status.*:.*Superseded' "docs/adr/ADR-005-eu-ai-act-compliance-toolkit.md"; then
+    pass "ADR-005 status updated to Superseded"
+  else
+    fail "ADR-005 still marked Accepted — should be Superseded by ADR-012"
+  fi
+fi
+
+# 15d: /ai-dev-log skill references the generator script
+AI_LOG_SKILL="skills/ai-dev-log/SKILL.md"
+if [ -f "$AI_LOG_SKILL" ]; then
+  if grep -q "scripts/generate-ai-dev-log.sh" "$AI_LOG_SKILL"; then
+    pass "$AI_LOG_SKILL references generator script"
+  else
+    fail "$AI_LOG_SKILL missing reference to generator script"
+  fi
+  if grep -q "Privacy Note" "$AI_LOG_SKILL"; then
+    pass "$AI_LOG_SKILL has Privacy Note section"
+  else
+    fail "$AI_LOG_SKILL missing Privacy Note"
+  fi
+else
+  fail "$AI_LOG_SKILL not found"
+fi
+
+# 15e: generate-ai-dev-log.sh script — strict mode + dependency check + executable
+SCRIPT="scripts/generate-ai-dev-log.sh"
+if [ -f "$SCRIPT" ]; then
+  if [ -x "$SCRIPT" ]; then
+    pass "$SCRIPT is executable"
+  else
+    fail "$SCRIPT is not executable"
+  fi
+  if grep -q "set -euo pipefail" "$SCRIPT"; then
+    pass "$SCRIPT uses strict mode"
+  else
+    fail "$SCRIPT missing 'set -euo pipefail'"
+  fi
+  if grep -q "command -v" "$SCRIPT"; then
+    pass "$SCRIPT has dependency check"
+  else
+    fail "$SCRIPT missing dependency check"
+  fi
+  if grep -q "trap.*EXIT" "$SCRIPT"; then
+    pass "$SCRIPT has tempfile cleanup trap"
+  else
+    fail "$SCRIPT missing cleanup trap"
+  fi
+else
+  fail "$SCRIPT not found"
+fi
+
+# 15f: /design Article 14 checkpoint integrated as Step 5
+DESIGN_SKILL="skills/design/SKILL.md"
+if [ -f "$DESIGN_SKILL" ]; then
+  if grep -q "Article 14 Human-Oversight Checkpoint\|¶4(a)\|¶4(e)" "$DESIGN_SKILL"; then
+    pass "$DESIGN_SKILL has Article 14 checkpoint"
+  else
+    fail "$DESIGN_SKILL missing Article 14 checkpoint"
+  fi
+  for phrase in \
+    "Scan" "Focus" "Full" \
+    "Promote only with evidence, explicit user request, or risk of staying smaller" \
+    "Confirmed" "Proposed" "Assumed" "Unknown" "Requires approval" \
+    "Direct" "Unverified" \
+    "Verify first: Yes" "Verify first: No" \
+    "Blocking" "Important" "Useful" \
+    "Every node must trace to evidence, assumption, or proposal" \
+    "software ecology impact"
+  do
+    if grep -q "$phrase" "$DESIGN_SKILL"; then
+      pass "$DESIGN_SKILL has architecture claim discipline phrase '$phrase'"
+    else
+      fail "$DESIGN_SKILL missing architecture claim discipline phrase '$phrase'"
+    fi
+  done
+fi
+
+echo ""
+
+# --- Check 16: v2.4.1 audience honesty (HABIT_QUIET opt-out + Core 5 tier + /brainstorm removal) ---
+echo "--- Check 16: v2.4.1 audience honesty (opt-out + Core 5 + brainstorm deletion) ---"
+HOOK="hooks/session-start.sh"
+if [ -f "$HOOK" ]; then
+  if grep -q 'HABIT_QUIET' "$HOOK"; then
+    pass "$HOOK references HABIT_QUIET opt-out"
+  else
+    fail "$HOOK missing HABIT_QUIET opt-out"
+  fi
+  if grep -qE 'HABIT_QUIET.*==.*1.*exit 0|HABIT_QUIET.*1.*&&.*exit' "$HOOK"; then
+    pass "$HOOK honors HABIT_QUIET=1 with early exit"
+  else
+    fail "$HOOK missing HABIT_QUIET=1 early exit guard"
+  fi
+  if grep -q "Core 5" "$HOOK"; then
+    pass "$HOOK surfaces the Core 5 tier"
+  else
+    fail "$HOOK missing Core 5 reference"
+  fi
+  if grep -q "not Vibe Coding" "$HOOK"; then
+    fail "$HOOK still has religious 'not Vibe Coding' framing"
+  else
+    pass "$HOOK framing softened (no 'not Vibe Coding')"
+  fi
+  if grep -q "/brainstorm" "$HOOK"; then
+    fail "$HOOK still references /brainstorm"
+  else
+    pass "$HOOK no /brainstorm reference"
+  fi
+else
+  fail "$HOOK not found"
+fi
+
+# /brainstorm skill must be deleted
+if [ -d "skills/brainstorm" ]; then
+  fail "skills/brainstorm/ should be removed in v2.4.1"
+else
+  pass "skills/brainstorm/ deleted (v2.4.1 honest correction)"
+fi
+
+# using-8-habits meta-skill surfaces Core 5
+META="skills/using-8-habits/SKILL.md"
+if [ -f "$META" ]; then
+  if grep -q "Core 5" "$META"; then
+    pass "$META has Core 5 tier section"
+  else
+    fail "$META missing Core 5 tier section"
+  fi
+  if grep -q "superpowers:brainstorming" "$META"; then
+    pass "$META references superpowers:brainstorming"
+  else
+    fail "$META missing superpowers:brainstorming pointer"
+  fi
+fi
+
+# /research skill points at Superpowers for fuzzy problems
+RESEARCH_SKILL="skills/research/SKILL.md"
+if [ -f "$RESEARCH_SKILL" ]; then
+  if grep -q "superpowers:brainstorming" "$RESEARCH_SKILL"; then
+    pass "$RESEARCH_SKILL references superpowers:brainstorming for fuzzy problems"
+  else
+    fail "$RESEARCH_SKILL missing superpowers:brainstorming pointer"
+  fi
+  for phrase in "software ecology impact" "review load" "validation cost" "handoff drift" "human attention"; do
+    if grep -q "$phrase" "$RESEARCH_SKILL"; then
+      pass "$RESEARCH_SKILL has software ecology phrase '$phrase'"
+    else
+      fail "$RESEARCH_SKILL missing software ecology phrase '$phrase'"
+    fi
+  done
+fi
+
+# ADR-006 exists
+ADR006="docs/adr/ADR-006-audience-honesty-and-superpowers-deferral.md"
+if [ -f "$ADR006" ]; then
+  pass "$ADR006 exists"
+else
+  fail "$ADR006 not found"
+fi
+
+echo ""
+
+# --- Check 17: EARS-notation in /requirements skill + guide ---
+echo "--- Check 17: EARS-notation in /requirements ---"
+REQ_SKILL="skills/requirements/SKILL.md"
+EARS_GUIDE="guides/ears-notation.md"
+if [ -f "$REQ_SKILL" ]; then
+  if grep -q "EARS" "$REQ_SKILL"; then
+    pass "$REQ_SKILL mentions EARS"
+  else
+    fail "$REQ_SKILL missing EARS reference"
+  fi
+  # All 5 EARS shape keywords present in skill
+  for shape in "Ubiquitous" "Event-driven" "State-driven" "Unwanted" "Optional"; do
+    if grep -q "$shape" "$REQ_SKILL"; then
+      pass "$REQ_SKILL mentions EARS shape '$shape'"
+    else
+      fail "$REQ_SKILL missing EARS shape '$shape'"
+    fi
+  done
+  # Opt-out rule for small features
+  if grep -qi "opt.?out\|skip EARS\|fewer than 3\|<3" "$REQ_SKILL"; then
+    pass "$REQ_SKILL documents EARS opt-out rule"
+  else
+    fail "$REQ_SKILL missing EARS opt-out rule"
+  fi
+  # v2.21.16 requirements intake modes — keeps /requirements aligned with /design claim discipline.
+  for phrase in \
+    "Existing-system mode" \
+    "Idea-mode" \
+    "Cite source evidence where available" \
+    "label assumptions before treating them as constraints" \
+    "Do not let proposed behavior masquerade as confirmed system fact"; do
+    if grep -q "$phrase" "$REQ_SKILL"; then
+      pass "$REQ_SKILL has requirements intake mode phrase '$phrase'"
+    else
+      fail "$REQ_SKILL missing requirements intake mode phrase '$phrase'"
+    fi
+  done
+else
+  fail "$REQ_SKILL not found"
+fi
+
+if [ -f "$EARS_GUIDE" ]; then
+  pass "$EARS_GUIDE exists"
+  # All 5 EARS shapes in guide
+  for shape in "Ubiquitous" "Event-driven" "State-driven" "Unwanted" "Optional"; do
+    if grep -q "### .*$shape" "$EARS_GUIDE"; then
+      pass "$EARS_GUIDE has section for '$shape' shape"
+    else
+      fail "$EARS_GUIDE missing section for '$shape' shape"
+    fi
+  done
+  # Worked login example (both before and after)
+  if grep -qi "login" "$EARS_GUIDE"; then
+    pass "$EARS_GUIDE has login worked example"
+  else
+    fail "$EARS_GUIDE missing worked example"
+  fi
+else
+  fail "$EARS_GUIDE not found"
+fi
+
+echo ""
+
+# --- Check 18: /using-8-habits meta-skill (onboarding) ---
+echo "--- Check 18: /using-8-habits meta-skill ---"
+META_SKILL="skills/using-8-habits/SKILL.md"
+# ADR-009: search triad (SKILL + reference + examples) as a unit for content assertions
+META_TRIAD="skills/using-8-habits/SKILL.md skills/using-8-habits/reference.md skills/using-8-habits/examples.md"
+META_TRIAD_EXISTING=""
+for f in $META_TRIAD; do [ -f "$f" ] && META_TRIAD_EXISTING="$META_TRIAD_EXISTING $f"; done
+if [ -f "$META_SKILL" ]; then
+  pass "$META_SKILL exists"
+  # Frontmatter: meta-skill is a starting point (SKILL.md only — frontmatter lives there)
+  if grep -qE '^prev-skill:\s*none' "$META_SKILL"; then
+    pass "$META_SKILL prev-skill is 'none'"
+  else
+    fail "$META_SKILL prev-skill should be 'none'"
+  fi
+  # Content: explains workflow + decision tree + all skills (across triad per ADR-009)
+  for keyword in "7-step workflow" "decision tree" "workflow skill" "assessment skill" "Covey" "Whole Person"; do
+    if grep -qi "$keyword" $META_TRIAD_EXISTING 2>/dev/null; then
+      pass "using-8-habits triad mentions '$keyword'"
+    else
+      fail "using-8-habits triad missing '$keyword'"
+    fi
+  done
+  # Must mention every current skill (anti-drift assertion, searches triad)
+  for skill_dir in skills/*/; do
+    skill_name=$(basename "$skill_dir")
+    [ "$skill_name" = "using-8-habits" ] && continue
+    if grep -q "/$skill_name\b" $META_TRIAD_EXISTING 2>/dev/null; then
+      pass "using-8-habits triad mentions /$skill_name"
+    else
+      fail "using-8-habits triad missing mention of /$skill_name (anti-drift assertion)"
+    fi
+  done
+  # README routes through the client-neutral catalog, not Claude slash labels.
+  if grep -Fq '(docs/skills-reference.md)' README.md && grep -Fq '| `using-8-habits` |' docs/skills-reference.md; then
+    pass "README.md links the catalog containing using-8-habits"
+  else
+    fail "README.md missing catalog route or using-8-habits catalog entry"
+  fi
+  if grep -q "/using-8-habits" CLAUDE.md; then
+    pass "CLAUDE.md cross-links to /using-8-habits"
+  else
+    fail "CLAUDE.md missing /using-8-habits cross-link"
+  fi
+  # Issue #149: Smart-routing mode (argument-driven) — section header + reference examples
+  if grep -q "^## Smart-routing mode" "$META_SKILL"; then
+    pass "$META_SKILL has '## Smart-routing mode' section (Issue #149)"
+  else
+    fail "$META_SKILL missing '## Smart-routing mode' section (Issue #149)"
+  fi
+  if grep -q "^## Smart-routing examples" skills/using-8-habits/reference.md 2>/dev/null; then
+    pass "using-8-habits/reference.md has '## Smart-routing examples' section (Issue #149)"
+  else
+    fail "using-8-habits/reference.md missing '## Smart-routing examples' section (Issue #149)"
+  fi
+else
+  fail "$META_SKILL not found"
+fi
+
+echo ""
+
+# --- Check 20: /review-ai Verification Phase (Issue #150) ---
+echo "--- Check 20: /review-ai Verification Phase ---"
+REVIEW_AI="skills/review-ai/SKILL.md"
+VERIFY_FAIL=0
+if [ -f "$REVIEW_AI" ]; then
+  # Section header present
+  if grep -q "^## Verification Phase" "$REVIEW_AI"; then
+    pass "$REVIEW_AI has '## Verification Phase' section"
+  else
+    fail "$REVIEW_AI missing '## Verification Phase' section (Issue #150)"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+  fi
+  # Plugin-boundary qualifier in the section: must say "guidance only" AND "NOT a hook"
+  # Boundary discipline — prevents future contributors from implementing as a git hook
+  if grep -q "guidance only" "$REVIEW_AI" && grep -q "NOT a hook" "$REVIEW_AI"; then
+    pass "$REVIEW_AI Verification Phase has plugin-boundary qualifier (guidance only, NOT a hook)"
+  else
+    fail "$REVIEW_AI Verification Phase missing plugin-boundary qualifier (need both 'guidance only' AND 'NOT a hook')"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+  fi
+  # Verification Table headers present (Finding | Severity | Fix Evidence | Status)
+  if grep -q "Fix Evidence" "$REVIEW_AI" && grep -q "RESOLVED" "$REVIEW_AI"; then
+    pass "$REVIEW_AI has Verification Table with Fix Evidence + RESOLVED status"
+  else
+    fail "$REVIEW_AI Verification Phase missing Verification Table example (need 'Fix Evidence' + 'RESOLVED')"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+  fi
+  # Find → Fix → Re-Verify literal loop name pinned (Issue #157 hardening — was
+  # self-disclosed weak in v2.14.0 CHANGELOG follow-up; passes-on-3-string-matches risk)
+  if grep -q "Find → Fix → Re-Verify" "$REVIEW_AI"; then
+    pass "$REVIEW_AI Verification Phase pins 'Find → Fix → Re-Verify' loop name"
+  else
+    fail "$REVIEW_AI Verification Phase missing 'Find → Fix → Re-Verify' literal loop name (Issue #157 hardening)"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+  fi
+  # Exactly 5 numbered steps (1.-5.) in the Verification Phase section
+  # awk extracts the section content between '## Verification Phase' and the next '## ',
+  # then grep counts numbered-step lines like "1. **List**" / "2. **Apply fix**" / etc.
+  verify_steps=$(awk '/^## Verification Phase/{found=1; next} /^## /{if(found) exit} found' "$REVIEW_AI" | grep -cE '^[1-5]\. \*\*')
+  if [ "$verify_steps" = "5" ]; then
+    pass "$REVIEW_AI Verification Phase has exactly 5 numbered steps"
+  else
+    fail "$REVIEW_AI Verification Phase has $verify_steps numbered steps (expected exactly 5 — Issue #157 hardening pins the loop count)"
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+  fi
+  for phrase in "review burden" "validator brittleness" "generated-content noise" "contract drift" "Software ecology"; do
+    if grep -q "$phrase" "$REVIEW_AI"; then
+      pass "$REVIEW_AI has software ecology review phrase '$phrase'"
+    else
+      fail "$REVIEW_AI missing software ecology review phrase '$phrase'"
+      VERIFY_FAIL=$((VERIFY_FAIL + 1))
+    fi
+  done
+else
+  fail "$REVIEW_AI not found"
+  VERIFY_FAIL=$((VERIFY_FAIL + 1))
+fi
+echo ""
+
+# --- Check 21: /consistency-check Pass 3 backtick-aware contract (Issue #167) ---
+# Asserts the Ambiguity pass spec includes the backtick-context filter rule.
+# Prevents regression where SKILL.md drifts back to plain `grep -nE` semantics
+# and the analyzer's own dogfood (docs/specs/consistency-check/prd.md:45) gets
+# falsely flagged as an unresolved [NEEDS CLARIFICATION] marker.
+echo "--- Check 21: /consistency-check Pass 3 backtick-aware contract ---"
+CC_SKILL="skills/consistency-check/SKILL.md"
+CC_FAIL=0
+if [ -f "$CC_SKILL" ]; then
+  # Backtick-context filter label present
+  if grep -q "Backtick-context filter" "$CC_SKILL"; then
+    pass "$CC_SKILL Pass 3 has 'Backtick-context filter' label"
+  else
+    fail "$CC_SKILL Pass 3 missing 'Backtick-context filter' label (Issue #167)"
+    CC_FAIL=$((CC_FAIL + 1))
+  fi
+  # Documentation-references semantic stated (vs unresolved markers)
+  if grep -q "documentation-references" "$CC_SKILL"; then
+    pass "$CC_SKILL Pass 3 states tokens-in-backticks are documentation-references"
+  else
+    fail "$CC_SKILL Pass 3 missing 'documentation-references' semantic (Issue #167)"
+    CC_FAIL=$((CC_FAIL + 1))
+  fi
+  # Pre-strip workflow specified (the actionable contract)
+  if grep -q "pre-strip" "$CC_SKILL"; then
+    pass "$CC_SKILL Pass 3 specifies pre-strip workflow"
+  else
+    fail "$CC_SKILL Pass 3 missing 'pre-strip' workflow contract (Issue #167)"
+    CC_FAIL=$((CC_FAIL + 1))
+  fi
+else
+  fail "$CC_SKILL not found"
+  CC_FAIL=$((CC_FAIL + 1))
+fi
+echo ""
+
+# --- Check 22: /requirements step 4a body-measure awk correctness (Issue #239) ---
+# v2.18.5 shipped a frontmatter-stripping awk in skills/requirements/SKILL.md step 4a
+# that returned 0 for ADRs/guides (no YAML frontmatter), contradicting the sub-step's
+# own case study. v2.18.6 replaces it with a frontmatter-aware variant: strip only
+# when NR==1 starts with ---; otherwise count whole body. This check runs the
+# prescribed command against representative files and asserts the body count matches
+# expected — closes the regression-gap explicitly named in #239 ("tests/** was untouched").
+echo "--- Check 22: /requirements step 4a awk body-measure correctness (Issue #239) ---"
+REQ_SKILL="skills/requirements/SKILL.md"
+REQ_FAIL=0
+if [ -f "$REQ_SKILL" ]; then
+  # Assert the SKILL.md text carries the frontmatter-aware variant, not the v2.18.5 broken form.
+  if grep -q "NR==1 && \$0==\"---\"{f=1; next} f && \$0==\"---\"{f=0; next} !f" "$REQ_SKILL"; then
+    pass "$REQ_SKILL step 4a uses frontmatter-aware awk variant (#239 fix present)"
+  else
+    fail "$REQ_SKILL step 4a missing frontmatter-aware awk variant — Issue #239 regression"
+    REQ_FAIL=$((REQ_FAIL + 1))
+  fi
+  # Assert the deprecated v2.18.5 form is no longer present (regression guard).
+  if grep -qE "awk '/\^---\\\$/\{c\+\+; next\} c>=2'" "$REQ_SKILL"; then
+    fail "$REQ_SKILL step 4a still contains the broken v2.18.5 awk variant (returns 0 for ADRs/guides) — Issue #239"
+    REQ_FAIL=$((REQ_FAIL + 1))
+  else
+    pass "$REQ_SKILL step 4a free of the v2.18.5 broken awk variant"
+  fi
+
+  # Run the prescribed awk against representative files and assert body counts.
+  # Expected values derived from `wc -l` (frontmatter-less files) or `wc -l` minus frontmatter lines (skills).
+  # Files chosen to cover all three artifact types named in step 4a step 1:
+  #   - ADR (no frontmatter, leading `# ADR-NNN: ...`) — case-study precedent
+  #   - guide (no frontmatter, leading `# Title`)
+  #   - skill (YAML frontmatter delimited by `---` on lines 1 and N)
+  RECEIPTS_FAIL=0
+  while IFS='|' read -r f expected; do
+    [ -z "$f" ] && continue
+    if [ ! -f "$f" ]; then
+      fail "Check 22 receipt file missing: $f"
+      RECEIPTS_FAIL=$((RECEIPTS_FAIL + 1))
+      continue
+    fi
+    actual=$(awk 'NR==1 && $0=="---"{f=1; next} f && $0=="---"{f=0; next} !f' "$f" | wc -l | tr -d ' ')
+    if [ "$actual" = "$expected" ]; then
+      pass "Check 22 receipt: $f body=$actual (expected $expected)"
+    else
+      fail "Check 22 receipt: $f body=$actual but expected $expected — #239 awk drift"
+      RECEIPTS_FAIL=$((RECEIPTS_FAIL + 1))
+    fi
+  # WARNING: editing any of the 5 files below requires updating the expected body count.
+  # Re-measure with: awk 'NR==1 && $0=="---"{f=1; next} f && $0=="---"{f=0; next} !f' <file> | wc -l
+  # ADR-016 is included to lock in the "mid-body `---` thematic breaks are body" behavior
+  # (broken v2.18.5 awk returned 157 by counting from the 2nd thematic break; fix returns 205 = full body).
+  done <<'EOF_RECEIPTS'
+docs/adr/ADR-016-t2-bag-drop-date-eviction-policy.md|205
+docs/adr/ADR-017-anthropic-skill-patterns-audit.md|152
+docs/adr/ADR-018-memory-layer-activation.md|145
+guides/cross-verification.md|139
+skills/requirements/SKILL.md|160
+EOF_RECEIPTS
+  if [ "$RECEIPTS_FAIL" -gt 0 ]; then
+    REQ_FAIL=$((REQ_FAIL + RECEIPTS_FAIL))
+  fi
+else
+  fail "$REQ_SKILL not found"
+  REQ_FAIL=$((REQ_FAIL + 1))
+fi
+echo ""
+
+# --- Check 23: /deploy-guide release decision gate ---
+echo "--- Check 23: /deploy-guide release decision gate ---"
+DEPLOY_SKILL="skills/deploy-guide/SKILL.md"
+if [ -f "$DEPLOY_SKILL" ]; then
+  for phrase in "Plugin release decision gate" "Release now" "Bundle later" "No release" "do not bump version files" "CI/CD proof discipline" "Configuration validation" "Workflow validation" "Runner identity evidence" "fresh current-main validation tag" "Use \`Refs\` instead of \`Closes\`"; do
+    if grep -q "$phrase" "$DEPLOY_SKILL"; then
+      pass "$DEPLOY_SKILL has release gate phrase '$phrase'"
+    else
+      fail "$DEPLOY_SKILL missing release gate phrase '$phrase'"
+    fi
+  done
+else
+  fail "$DEPLOY_SKILL not found"
+fi
+echo ""
+
+# --- Check 19: Docs freshness vs plugin.json version ---
+# Enforces version propagation across changelog surfaces. Issue #106/#107 (stuck-at-v2.N-5 drift);
+# tightened 2026-04-17 per #124 F1+F2 after v2.9.0+v2.11.0 (pointer-to-CHANGELOG.md fallback removed —
+# wiki was passing on literal string "CHANGELOG.md" even when entry missing). See CONTRIBUTING.md § Testing Conventions.
+echo "--- Check 19: Docs freshness vs plugin.json version ---"
+
+# Extract current version from plugin.json — no pipe, SIGPIPE-safe (see CONTRIBUTING.md)
+current_version=$(awk -F'"' '/"version"/{print $4; exit}' .claude-plugin/plugin.json)
+
+if [ -z "$current_version" ]; then
+  fail "could not extract version from .claude-plugin/plugin.json"
+else
+  # A. README.md must mention the current version somewhere (typically in "What's New")
+  if grep -q "v${current_version}" README.md; then
+    pass "README.md mentions current version v${current_version}"
+  else
+    fail "README.md does not mention v${current_version} — CHANGELOG.md likely updated but downstream propagation was skipped. See CONTRIBUTING.md § Testing Conventions."
+  fi
+
+  # B. CHANGELOG.md must have version header ^## v<version> (added 2026-04-17 per #124 F1
+  # after v2.9.0 + v2.11.0 missed entries). Root CHANGELOG is authoritative per ADR-004.
+  if grep -q "^## v${current_version}" CHANGELOG.md; then
+    pass "CHANGELOG.md contains v${current_version} entry"
+  else
+    fail "CHANGELOG.md missing '## v${current_version}' section header — backfill before release. See issue #124 F1."
+  fi
+
+  # C. docs/wiki/Changelog.md must have ^## v<version>. Pointer-only assertion broke in v2.9.0/v2.11.0
+  # (passed on literal "CHANGELOG.md" string even when entry missing); requires actual entry now.
+  if grep -q "^## v${current_version}" docs/wiki/Changelog.md; then
+    pass "docs/wiki/Changelog.md contains v${current_version} entry"
+  else
+    fail "docs/wiki/Changelog.md missing '## v${current_version}' section — pointer-to-CHANGELOG.md no longer sufficient. See issue #124 F2."
+  fi
+
+  # D. docs/wiki/Changelog.md badge must match current version (added 2026-04-17 after v2.11.0 stale-badge ship).
+  if grep -q "badge/latest-v${current_version}-blue" docs/wiki/Changelog.md; then
+    pass "docs/wiki/Changelog.md badge matches v${current_version}"
+  else
+    fail "docs/wiki/Changelog.md badge stale — bump 'latest-v…' to v${current_version}."
+  fi
+
+  # E + F. SELF-CHECK.md body freshness vs git tag history (added 2026-04-25 per #141
+  # — v2.13.0 footer said Previous: 2.7.1 + per-release list ended at v2.8.0 = 6 silent ships).
+  # Source of truth: git tag -l "v2.*" (v1.x predates per-release convention; see CHANGELOG.md note).
+  # Dev-env: no tags → WARN+skip (CI sets fetch-tags: true so drift still caught at merge).
+  all_tags=$(git tag -l "v2.*" 2>/dev/null | sort -V || echo "")
+  if [ -z "$all_tags" ]; then
+    warn "git tag history unavailable — skipping SELF-CHECK.md body freshness (sub-checks E + F). CI sets fetch-tags: true."
+  else
+    # E. Footer Previous: must match tag before current_version. Two shapes:
+    #   post-release (current tagged) → prior tag in sorted list; pre-release (bumped, not pushed) → last tag.
+    if echo "$all_tags" | grep -qx "v${current_version}"; then
+      prev_version=$(echo "$all_tags" | awk -v cur="v${current_version}" '
+        $0 == cur { print prev; exit }
+        { prev = $0 }
+      ' | sed 's/^v//')
+    else
+      prev_version=$(echo "$all_tags" | tail -1 | sed 's/^v//')
+    fi
+
+    if [ -z "$prev_version" ]; then
+      warn "could not derive previous version for v${current_version} from git tags — is this the first release?"
+    elif grep -Eq "Previous: ${prev_version}\b" SELF-CHECK.md; then
+      pass "SELF-CHECK.md footer references Previous: ${prev_version}"
+    else
+      fail "SELF-CHECK.md footer stale — expected 'Previous: ${prev_version}' (derived from git tags); update the last line of the file."
+    fi
+
+    # F. Per-release score list: one row per tagged version (no gaps) + row for current_version (release-in-progress safe).
+    missing=()
+    while IFS= read -r tag; do
+      ver="${tag#v}"
+      if ! grep -Eq "^- v${ver}: " SELF-CHECK.md; then
+        missing+=("v${ver}")
+      fi
+    done <<< "$all_tags"
+
+    if ! grep -Eq "^- v${current_version}: " SELF-CHECK.md; then
+      missing+=("v${current_version}")
+    fi
+
+    if [ ${#missing[@]} -eq 0 ]; then
+      pass "SELF-CHECK.md per-release list covers all tagged versions + current ($(echo "$all_tags" | wc -l | tr -d ' ') tags + v${current_version})"
+    else
+      fail "SELF-CHECK.md per-release list missing ${#missing[@]} version(s): ${missing[*]} — add a '- v<x.y.z>: Body N, Mind N, Heart N, Spirit N = **N.N** (…)' row per tagged release."
+    fi
+  fi
+
+  # G. README.md "## What's New in v<current_version>" section header (added 2026-05-02 per #157).
+  # Sub-check A passes on badge URL alone (releases/tag/v<x.y.z>) — same bug class as #124 pointer-fallback.
+  # Tighter assertion prevents README "What's New" drift like SELF-CHECK.md did before #141/#144.
+  if grep -q "^## What's New in v${current_version}" README.md; then
+    pass "README.md contains '## What's New in v${current_version}' section header"
+  else
+    fail "README.md missing '## What's New in v${current_version}' section header — sub-check A passed on badge URL but the user-facing upgrade-discovery surface is stale. Add the section between the existing 'Zero dependencies' block and the previous '## What's New in v...' entry. See issue #157."
+  fi
+
+  # H. README.md version badge must match current version. v2.21.0 initially updated the
+  # "What's New" section and footer but left the top badge pointing at v2.20.2.
+  if grep -q "badge/Version-${current_version}-brightgreen" README.md &&
+     grep -q "releases/tag/v${current_version}" README.md; then
+    pass "README.md version badge matches v${current_version}"
+  else
+    fail "README.md version badge stale — bump both badge text and release link to v${current_version}."
+  fi
+
+  # I. README.md TOC "What's New" anchor must point at the current section slug (added 2026-06-14 per #317).
+  # GitHub slugifies "## What's New in v2.21.28" → "whats-new-in-v22128" (lowercase, drop apostrophe/dots,
+  # spaces→hyphens). Sub-check G verifies the section EXISTS; this verifies the in-page TOC link targets it.
+  # The TOC anchor drifted unnoticed from v2.21.12→v2.21.27 (15 releases) because no check derived the slug.
+  toc_slug="whats-new-in-v$(printf '%s' "$current_version" | tr -d '.')"
+  if grep -q "(#${toc_slug})" README.md; then
+    pass "README.md TOC 'What's New' anchor points at current section (#${toc_slug})"
+  else
+    fail "README.md TOC 'What's New' anchor stale — update the '[What's New](#...)' link to '(#${toc_slug})' so it targets the current '## What's New in v${current_version}' section, not an older release. See issue #317."
+  fi
+fi
+
+echo ""
+
+# --- Architecture Fitness Functions: track health metrics; BREACH fails the build ---
+echo "=== Architecture Fitness Functions ==="
+echo ""
+FITNESS_BREACH=0
+
+# --- F1: Skill Complexity Budget ---
+echo "--- F1: Skill Complexity Budget ---"
+TOTAL_LINES=0
+MAX_LINES=0
+MAX_SKILL=""
+SKILL_COUNT=0
+for skill_dir in skills/*/; do
+  skill_file="${skill_dir}SKILL.md"
+  [ ! -f "$skill_file" ] && continue
+  lines=$(wc -l < "$skill_file" | tr -d ' ')
+  TOTAL_LINES=$((TOTAL_LINES + lines))
+  SKILL_COUNT=$((SKILL_COUNT + 1))
+  if [ "$lines" -gt "$MAX_LINES" ]; then
+    MAX_LINES=$lines
+    MAX_SKILL=$(basename "$skill_dir")
+  fi
+done
+if [ "$SKILL_COUNT" -gt 0 ]; then
+  AVG_LINES=$((TOTAL_LINES / SKILL_COUNT))
+else
+  AVG_LINES=0
+fi
+
+F1_STATUS="HEALTHY"
+if [ "$AVG_LINES" -ge 200 ] || [ "$MAX_LINES" -ge 400 ]; then
+  F1_STATUS="BREACH"
+  FITNESS_BREACH=$((FITNESS_BREACH + 1))
+elif [ "$AVG_LINES" -ge 150 ] || [ "$MAX_LINES" -ge 300 ]; then
+  F1_STATUS="WARNING"
+fi
+echo "  FITNESS: skill-complexity avg=$AVG_LINES max=$MAX_LINES (${MAX_SKILL}) [$F1_STATUS]"
+echo ""
+
+# --- F2: Validation Coverage Ratio ---
+echo "--- F2: Validation Coverage Ratio ---"
+# Count assertable items: skills × 8 checkable properties + agents × 4 + ADRs × 6 + cross-refs
+ASSERTABLE=0
+# Per-skill checkable items: workflow skills = 11 (frontmatter 3 + sections 2 + chain 2 + content-depth 2 + handoff 2); standalone = 9 (no handoff).
+for skill_dir in skills/*/; do
+  [ ! -d "$skill_dir" ] && continue
+  sname=$(basename "$skill_dir")
+  case "$sname" in
+    research|requirements|design|breakdown|build-brief|review-ai|deploy-guide|monitor-setup)
+      ASSERTABLE=$((ASSERTABLE + 11))
+      ;;
+    *)
+      ASSERTABLE=$((ASSERTABLE + 9))
+      ;;
+  esac
+done
+# Agents: 4 fields each
+AGENT_COUNT=$(find agents/ -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+ASSERTABLE=$((ASSERTABLE + AGENT_COUNT * 4))
+# ADRs: 6 checks each
+ASSERTABLE=$((ASSERTABLE + ADR_COUNT * 6))
+# Cross-references: version(3) + readme-skills(1) + load-directives(1) + self-check(1) + size(1)
+ASSERTABLE=$((ASSERTABLE + 7))
+
+# Total assertions = structure PASS (read from /tmp/validate-structure-pass.txt) + this script's PASS.
+STRUCT_ASSERTIONS=157  # fallback if structure script hasn't run
+if [ -f /tmp/validate-structure-pass.txt ]; then
+  STRUCT_ASSERTIONS=$(cat /tmp/validate-structure-pass.txt | tr -d ' ')
+fi
+TOTAL_ASSERTIONS=$((STRUCT_ASSERTIONS + PASS))
+
+if [ "$ASSERTABLE" -gt 0 ]; then
+  COVERAGE=$(awk "BEGIN {printf \"%.2f\", $TOTAL_ASSERTIONS / $ASSERTABLE}")
+  COVERAGE_PCT=$(awk "BEGIN {printf \"%.0f\", ($TOTAL_ASSERTIONS / $ASSERTABLE) * 100}")
+  COVERAGE_CHECK=$(awk "BEGIN {print ($TOTAL_ASSERTIONS / $ASSERTABLE < 0.7) ? 1 : 0}")
+else
+  COVERAGE="0.00"
+  COVERAGE_PCT="0"
+  COVERAGE_CHECK=0
+fi
+
+F2_STATUS="HEALTHY"
+if [ "$COVERAGE_CHECK" -eq 1 ]; then
+  F2_STATUS="BREACH"
+  FITNESS_BREACH=$((FITNESS_BREACH + 1))
+fi
+echo "  FITNESS: validation-coverage ratio=$COVERAGE ($TOTAL_ASSERTIONS/$ASSERTABLE = ${COVERAGE_PCT}%) [$F2_STATUS]"
+echo ""
+
+# --- F3: Convention Consistency Score ---
+echo "--- F3: Convention Consistency Score ---"
+CONSISTENT=0
+TOTAL_SKILLS=0
+for skill_dir in skills/*/; do
+  skill_file="${skill_dir}SKILL.md"
+  [ ! -f "$skill_file" ] && continue
+  TOTAL_SKILLS=$((TOTAL_SKILLS + 1))
+  skill_ok=1
+
+  # Check: frontmatter exists with 3 required fields. Uses awk (not sed|head) for SIGPIPE safety
+  # under set -o pipefail. Triggered by ai-dev-log/SKILL.md `---` rule at line 65 → sed emits 187 lines,
+  # overflows head -20, GNU sed exit 4 on Linux (BSD sed silent). See validate-structure.sh:27.
+  fm=$(awk '/^---$/{c++; print; if(c==2) exit; next} c==1' "$skill_file")
+  for field in "name:" "description:" "user-invocable:"; do
+    echo "$fm" | grep -q "$field" || skill_ok=0
+  done
+
+  # Check: required sections present
+  grep -q "^## When to Skip" "$skill_file" || skill_ok=0
+  grep -q "^## Definition of Done" "$skill_file" || skill_ok=0
+
+  # Check: DoD has ≥3 items
+  dod=$(awk '/^## Definition of Done/{found=1; next} /^## /{if(found) exit} found' "$skill_file" | grep -c '^\- \[ \]' || true)
+  [ "$dod" -ge 3 ] || skill_ok=0
+
+  # Check: When to Skip has content
+  skip=$(awk '/^## When to Skip/{found=1; next} /^## /{if(found) exit} found && NF' "$skill_file" | wc -l | tr -d ' ')
+  [ "$skip" -ge 2 ] || skill_ok=0
+
+  # Check: word count in range
+  words=$(wc -w < "$skill_file" | tr -d ' ')
+  [ "$words" -ge 200 ] && [ "$words" -le 2000 ] || skill_ok=0
+
+  if [ "$skill_ok" -eq 1 ]; then
+    CONSISTENT=$((CONSISTENT + 1))
+  fi
+done
+
+if [ "$TOTAL_SKILLS" -gt 0 ]; then
+  CONSISTENCY_PCT=$(awk "BEGIN {printf \"%.0f\", ($CONSISTENT / $TOTAL_SKILLS) * 100}")
+else
+  CONSISTENCY_PCT="0"
+fi
+
+F3_STATUS="HEALTHY"
+if [ "$CONSISTENT" -ne "$TOTAL_SKILLS" ]; then
+  F3_STATUS="BREACH"
+  FITNESS_BREACH=$((FITNESS_BREACH + 1))
+fi
+echo "  FITNESS: convention-consistency score=${CONSISTENCY_PCT}% ($CONSISTENT/$TOTAL_SKILLS) [$F3_STATUS]"
+echo ""
+
+# --- Summary ---
+echo "=== Summary ==="
+echo "PASS: $PASS"
+echo "FAIL: $ERRORS"
+echo "WARN: $WARNINGS"
+echo "FITNESS BREACHES: $FITNESS_BREACH"
+echo ""
+
+TOTAL_ISSUES=$((ERRORS + FITNESS_BREACH))
+if [ "$TOTAL_ISSUES" -gt 0 ]; then
+  echo "RESULT: FAILED ($ERRORS errors, $FITNESS_BREACH fitness breaches)"
+  exit 1
+else
+  echo "RESULT: ALL CHECKS PASSED"
+  exit 0
+fi

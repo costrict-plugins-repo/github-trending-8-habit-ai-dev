@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"/bin:/usr/bin:/usr/sbin:/sbin:${PATH:-}\"; export PATH; PLUGIN_ROOT=\"${CLAUDE_PLUGIN_ROOT:-${CODEX_MANAGED_PACKAGE_ROOT:-.}}\"; CLAUDE_PLUGIN_ROOT=\"$PLUGIN_ROOT\" /bin/bash \"$PLUGIN_ROOT/hooks/session-start.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
